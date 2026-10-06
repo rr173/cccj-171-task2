@@ -39,6 +39,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .pill.active { background:rgba(61,220,132,.15); color:var(--ok); }
   .pill.gated { background:rgba(255,179,71,.15); color:var(--warn); }
   .pill.terminated { background:rgba(255,92,121,.18); color:var(--bad); }
+  .pill.pending { background:rgba(91,140,255,.17); color:var(--accent); }
+  .pill.approved { background:rgba(61,220,132,.15); color:var(--ok); }
+  .pill.rejected,.pill.withdrawn,.pill.expired,.pill.conflicted {
+    background:rgba(255,92,121,.16); color:var(--bad); }
+  .confirmline { display:flex; align-items:center; gap:7px; margin:10px 0; }
+  .confirmline input { width:auto; }
+  .diffbox { border:1px solid var(--line); border-radius:8px; padding:8px; margin:8px 0; }
   .kv { display:grid; grid-template-columns:130px 1fr; gap:4px 10px; font-size:13px; }
   .kv dt { color:var(--muted); } .kv dd { margin:0; word-break:break-all; }
   table { width:100%; border-collapse:collapse; font-size:12.5px; }
@@ -131,11 +138,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>4 · 策略 API（新版本对新请求生效）</h2>
-      <details open><summary>策略 JSON（version 必须大于当前）</summary>
+      <h2>4 · 策略草稿（管理员提交，审批者确认差异后发布）</h2>
+      <div class="row">
+        <div><label>操作者 ID</label><input id="actor_id" value="admin-1"></div>
+        <div><label>角色（由网关注入；页面仅用于演示）</label>
+          <select id="actor_role"><option value="admin">admin：提交/撤回</option>
+          <option value="approver">approver：批准/拒绝</option>
+          <option value="viewer">viewer：未授权</option></select>
+        </div>
+      </div>
+      <details open><summary>新策略 JSON（version 必须大于当前）</summary>
         <textarea id="policyJson"></textarea></details>
-      <button onclick="publishPolicy()">发布新版本</button>
-      <button class="ghost" onclick="loadTightenedPolicy()">载入「收紧」模板(v2)</button>
+      <button onclick="submitDraft()">提交待审草稿</button>
+      <button class="ghost" onclick="loadTightenedPolicy()">载入「收紧」模板</button>
     </div>
 
     <div class="card">
@@ -157,6 +172,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="card">
       <h2>会话状态（水位单一真相）</h2>
       <div id="sessionView" class="muted">未登录。登录后此处显示实时状态，每 2 秒自动刷新。</div>
+    </div>
+    <div class="card">
+      <h2>策略待审草稿 · 差异 · 审批结果</h2>
+      <div id="draftView" class="muted">正在加载草稿……</div>
     </div>
     <div class="card">
       <h2>事件水位线（accepted=0 的旧信号不占 seq）</h2>
@@ -190,10 +209,15 @@ function toast(msg, kind='') {
 async function api(path, body) {
   const opts = body !== undefined
     ? { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }
-    : {};
+    : { headers:{} };
   if (TOKEN && path !== '/api/login') {
     opts.headers = opts.headers || {};
     opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+  }
+  if (path.includes('polic')) {
+    opts.headers = opts.headers || {};
+    opts.headers['X-User-Id'] = val('actor_id');
+    opts.headers['X-User-Roles'] = val('actor_role');
   }
   const r = await fetch(path, opts);
   const data = await r.json().catch(() => ({}));
@@ -245,7 +269,7 @@ async function reauth() {
   } catch (e) { toast(e.message, 'err'); }
 }
 async function attest() {
-  try { const s = await api('/api/attest', { level: +val('at_level'), nonce: +val('at_nonce') });
+  try { const s = await api('/api/attestation', { level: +val('at_level'), nonce: +val('at_nonce') });
     toast('设备证明已更新，水位 seq=' + s.watermark, 'ok'); refresh();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -265,13 +289,37 @@ async function concurrentKill() {
   refresh();
 }
 
-async function publishPolicy() {
+async function submitDraft() {
   let body;
   try { body = JSON.parse(val('policyJson')); }
   catch(e){ return toast('JSON 解析失败：'+e.message,'err'); }
-  try { await api('/api/policies', body);
-    toast('策略 v'+body.version+' 已发布（对新请求生效）','ok');
+  try { const r = await api('/api/policy-drafts', body);
+    toast('草稿已提交 ' + r.draft.id + '；当前策略未改变','ok');
+    await refreshDrafts();
   } catch(e){ toast(e.message,'err'); }
+}
+async function approveDraft(id, version) {
+  try {
+    const confirmed = document.getElementById('confirm_' + id)?.checked;
+    const r = await api('/api/policy-drafts/' + id + '/approve',
+      { confirm_diff: !!confirmed, expected_version: version });
+    toast('策略 v'+r.draft.published_version+' 已发布（对新请求生效）','ok');
+    await refreshDrafts(); refresh();
+  } catch(e){
+    toast(e.message,'err'); await refreshDrafts(); refresh();
+  }
+}
+async function rejectDraft(id) {
+  const reason = prompt('拒绝原因（可留空）', '差异未通过');
+  if (reason === null) return;
+  try { await api('/api/policy-drafts/' + id + '/reject', { reason: reason || 'rejected' });
+    toast('草稿已拒绝；当前生效策略不变','ok'); await refreshDrafts();
+  } catch(e){ toast(e.message,'err'); await refreshDrafts(); }
+}
+async function withdrawDraft(id) {
+  try { await api('/api/policy-drafts/' + id + '/withdraw', { reason:'console withdraw' });
+    toast('草稿已撤回；当前生效策略不变','ok'); await refreshDrafts();
+  } catch(e){ toast(e.message,'err'); await refreshDrafts(); }
 }
 async function loadTightenedPolicy() {
   const cur = await api('/api/policies');
@@ -357,6 +405,57 @@ function renderAudit(rows) {
     </tr>`).join('');
 }
 
+function renderDiff(diff) {
+  const groups = [
+    ['新增规则', diff.rules.added], ['删除规则', diff.rules.removed],
+    ['修改规则', diff.rules.changed],
+    ['新增信号', diff.signal_rules.added], ['删除信号', diff.signal_rules.removed],
+    ['修改信号', diff.signal_rules.changed],
+    ['新增约束', diff.constraints.added], ['删除约束', diff.constraints.removed],
+    ['修改约束', diff.constraints.changed], ['修改设置', diff.settings.changed],
+  ].filter(([, items]) => items && items.length);
+  if (!groups.length) return '<div class="muted">内容无差异（仅版本或待审元数据变化）。</div>';
+  return groups.map(([name, items]) =>
+    '<div class="diffbox"><b>'+name+' × '+items.length+'</b><pre>'+
+    esc(JSON.stringify(items, null, 2))+'</pre></div>'
+  ).join('');
+}
+
+function renderDrafts(drafts) {
+  if (!drafts.length) return '<span class="muted">暂无待审或历史草稿。</span>';
+  return drafts.map(d => {
+    const stale = d.status === 'pending' && d.current_version !== d.base_version;
+    const status = stale ? 'conflicted' : d.effective_status;
+    const actions = d.status === 'pending'
+      ? `<label class="confirmline"><input type="checkbox" id="confirm_${esc(d.id)}">
+           我已确认上述差异（幂等批准必需）</label>
+         <button onclick="approveDraft('${esc(d.id)}', ${d.target_version})">确认差异并发布</button>
+         <button class="danger" onclick="rejectDraft('${esc(d.id)}')">拒绝</button>
+         <button class="ghost" onclick="withdrawDraft('${esc(d.id)}')">撤回</button>`
+      : `<div class="muted">结果：${esc(d.result_reason || d.status)}
+           ${d.decided_at ? ' · ' + esc(d.decided_at) : ''}</div>`;
+    return `<div class="diffbox">
+      <div><span class="pill ${esc(status)}">${esc(status)}</span>
+        <b> v${d.base_version} → v${d.target_version}</b></div>
+      <div class="muted tag">${esc(d.id)} · 提交人 ${esc(d.submitted_by)}
+        · ${esc(d.submitted_at)} · 过期 ${esc(d.expires_at)}</div>
+      ${stale ? '<p class="deny">审批基线已变化，批准将返回冲突，且不会覆盖新版本。</p>' : ''}
+      ${renderDiff(d.diff)}
+      ${actions}
+    </div>`;
+  }).join('');
+}
+
+async function refreshDrafts() {
+  try {
+    const r = await api('/api/policy-drafts');
+    document.getElementById('draftView').innerHTML = renderDrafts(r.drafts);
+  } catch(e) {
+    document.getElementById('draftView').innerHTML =
+      '<span class="deny">草稿加载失败：'+esc(e.message)+'</span>';
+  }
+}
+
 async function refresh() {
   if (!TOKEN) return;
   try {
@@ -372,10 +471,11 @@ async function refresh() {
 }
 function startPolling() {
   clearInterval(timer);
-  timer = setInterval(refresh, 2000);
+  timer = setInterval(() => { refreshDrafts(); refresh(); }, 2000);
 }
 
-if (TOKEN) { refresh(); startPolling(); }
+refreshDrafts();
+if (TOKEN) { refresh(); startPolling(); } else { startPolling(); }
 api('/api/policies').then(p => {
   if (!val('policyJson')) val('policyJson', JSON.stringify(
     { ...p.policies.at(-1).policy, version: p.policies.at(-1).version+1 }, null, 2));

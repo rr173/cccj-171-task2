@@ -34,11 +34,14 @@ import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from .policy import Policy, default_policy_v1
+from .policy import Policy, PolicyError, default_policy_v1
 from .policy import ATTESTATION, REAUTH, REVOKE, TERMINATE
+
+POLICY_ADMIN_ROLE = "admin"
+POLICY_APPROVER_ROLE = "approver"
 
 
 def utcnow() -> datetime:
@@ -53,17 +56,137 @@ def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+def _coerce_actor(
+    actor: Any,
+    *,
+    required_role: Optional[str] = None,
+) -> dict[str, str]:
+    if not isinstance(actor, dict):
+        raise StoreError("authenticated actor is required", 401, "unauthorized")
+    actor_id = str(actor.get("id") or "").strip()
+    if not actor_id:
+        raise StoreError("actor id is required", 401, "unauthorized")
+    roles = actor.get("roles")
+    if roles is None:
+        roles = [actor.get("role")] if actor.get("role") is not None else []
+    if not isinstance(roles, (list, tuple, set)):
+        roles = [roles]
+    role_set = {str(r).strip() for r in roles if str(r).strip()}
+    result = {"id": actor_id, "roles": ",".join(sorted(role_set))}
+    if required_role is not None and required_role not in role_set:
+        raise StoreError(
+            f"actor {actor_id!r} lacks required role {required_role!r}",
+            403,
+            "forbidden",
+        )
+    return result
+
+
+def _actor_has_role(actor: dict[str, str], role: str) -> bool:
+    return role in {r for r in actor.get("roles", "").split(",") if r}
+
+
+def _entry_key(section: str, item: dict[str, Any], index: int) -> str:
+    if item.get("id"):
+        return str(item["id"])
+    if section == "signal_rules":
+        return f"{item.get('signal', '?')}:{item.get('action', '?')}"
+    parts = [
+        ",".join(item.get("roles", [])),
+        ",".join(item.get("resources", [])),
+        ",".join(item.get("actions", [])),
+        item.get("effect", ""),
+    ]
+    return f"{index}:" + "|".join(parts)
+
+
+def policy_diff(
+    base: Optional[dict[str, Any]],
+    target: dict[str, Any],
+    base_version: Optional[int] = None,
+    target_version: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return a compact JSON-safe structural diff for approval review."""
+    base = base or {}
+    diff: dict[str, Any] = {
+        "base_version": base_version,
+        "target_version": target_version,
+        "rules": {"added": [], "removed": [], "changed": []},
+        "signal_rules": {"added": [], "removed": [], "changed": []},
+        "constraints": {"added": [], "removed": [], "changed": []},
+        "settings": {"changed": []},
+        "summary": {},
+    }
+
+    for section in ("rules", "signal_rules"):
+        old_items = list(base.get(section, []) or [])
+        new_items = list(target.get(section, []) or [])
+        old = {_entry_key(section, item, i): item for i, item in enumerate(old_items)}
+        new = {_entry_key(section, item, i): item for i, item in enumerate(new_items)}
+        diff[section]["added"] = [new[k] for k in new.keys() - old.keys()]
+        diff[section]["removed"] = [old[k] for k in old.keys() - new.keys()]
+        for key in old.keys() & new.keys():
+            if json.dumps(old[key], sort_keys=True) != json.dumps(
+                new[key], sort_keys=True
+            ):
+                diff[section]["changed"].append(
+                    {"key": key, "before": old[key], "after": new[key]}
+                )
+
+    old_constraints = base.get("constraints", {}) or {}
+    new_constraints = target.get("constraints", {}) or {}
+    diff["constraints"]["added"] = [
+        {"key": k, "value": new_constraints[k]}
+        for k in new_constraints.keys() - old_constraints.keys()
+    ]
+    diff["constraints"]["removed"] = [
+        {"key": k, "value": old_constraints[k]}
+        for k in old_constraints.keys() - new_constraints.keys()
+    ]
+    for key in old_constraints.keys() & new_constraints.keys():
+        if old_constraints[key] != new_constraints[key]:
+            diff["constraints"]["changed"].append(
+                {"key": key, "before": old_constraints[key], "after": new_constraints[key]}
+            )
+
+    for key in set(base) | set(target):
+        if key in ("version", "rules", "signal_rules", "constraints"):
+            continue
+        if base.get(key) != target.get(key):
+            diff["settings"]["changed"].append(
+                {"key": key, "before": base.get(key), "after": target.get(key)}
+            )
+
+    diff["summary"] = {
+        f"{section}_{kind}": len(diff[section][kind])
+        for section in ("rules", "signal_rules", "constraints", "settings")
+        for kind in diff[section]
+    }
+    diff["summary"]["total_changes"] = sum(
+        len(diff[section][kind])
+        for section in ("rules", "signal_rules", "constraints", "settings")
+        for kind in diff[section]
+    )
+    return diff
+
+
 class StoreError(Exception):
     """Base error; ``code`` mirrors an HTTP status for the API layer."""
 
-    def __init__(self, message: str, code: int = 400):
+    def __init__(
+        self,
+        message: str,
+        code: int = 400,
+        error_code: Optional[str] = None,
+    ):
         super().__init__(message)
         self.code = code
+        self.error_code = error_code
 
 
 class SessionTerminated(StoreError):
     def __init__(self):
-        super().__init__("session is terminated", 409)
+        super().__init__("session is terminated", 409, "session_terminated")
 
 
 @dataclass
@@ -76,8 +199,15 @@ class Decision:
 
 
 class Store:
-    def __init__(self, path: str = ":memory:", clock=utcnow):
+    def __init__(
+        self,
+        path: str = ":memory:",
+        clock=utcnow,
+        draft_ttl_seconds: int = 900,
+    ):
         self._clock = clock
+        self.draft_ttl_seconds = draft_ttl_seconds
+        self._policy_lock = threading.Lock()
         self._conn = sqlite3.connect(
             path,
             check_same_thread=False,
@@ -113,6 +243,29 @@ class Store:
                 body         TEXT NOT NULL,
                 published_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS policy_drafts (
+                id               TEXT PRIMARY KEY,
+                base_version     INTEGER NOT NULL,
+                target_version   INTEGER NOT NULL,
+                body             TEXT NOT NULL,
+                status           TEXT NOT NULL CHECK (
+                                   status IN ('pending','approved','rejected',
+                                              'withdrawn','conflicted')
+                                 ),
+                submitted_by     TEXT NOT NULL,
+                submitted_roles  TEXT NOT NULL,
+                submitted_at     TEXT NOT NULL,
+                expires_at       TEXT NOT NULL,
+                decided_by       TEXT,
+                decided_roles    TEXT,
+                decided_at       TEXT,
+                result_reason    TEXT,
+                published_version INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_policy_drafts_status
+                ON policy_drafts(status, submitted_at);
 
             CREATE TABLE IF NOT EXISTS sessions (
                 id                 TEXT PRIMARY KEY,
@@ -178,33 +331,396 @@ class Store:
     # ------------------------------------------------------------- policies
 
     def publish_policy(self, body: dict[str, Any]) -> Policy:
-        policy = Policy.from_dict(body)
-        now = iso(self._clock())
+        """Directly publish a versioned policy.
+
+        HTTP policy administration must go through :meth:`submit_policy_draft`
+        and approval.  This compatibility entry point is retained for first-boot
+        tooling, migrations and existing callers.
+        """
         try:
+            policy = Policy.from_dict(body)
+        except PolicyError as exc:
+            raise StoreError(str(exc), 400, "invalid_policy") from exc
+        now_dt = self._clock()
+        with self._policy_lock:
             self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute(
-                "SELECT MAX(version) AS v FROM policies"
-            ).fetchone()
-            if row["v"] is not None and policy.version <= row["v"]:
-                self._conn.execute("ROLLBACK")
-                raise StoreError(
-                    f"policy version must be > {row['v']} (new versions are immutable)",
-                    409,
-                )
-            self._conn.execute(
-                "INSERT INTO policies(version, body, published_at) VALUES (?,?,?)",
-                (policy.version, json.dumps(policy.body), now),
+            try:
+                policy = self._publish_policy_locked(policy, now_dt)
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        return policy
+
+    def _publish_policy_locked(self, policy: Policy, now_dt: datetime) -> Policy:
+        """Insert and activate a policy while already holding a write txn."""
+        row = self._conn.execute(
+            "SELECT MAX(version) AS v FROM policies"
+        ).fetchone()
+        if row["v"] is not None and policy.version <= row["v"]:
+            raise StoreError(
+                f"policy version must be > {row['v']} (new versions are immutable)",
+                409,
+                "policy_version_conflict",
             )
-            self._conn.execute("COMMIT")
-        except sqlite3.Error as exc:
-            self._safe_rollback()
-            raise StoreError(f"database error: {exc}", 500) from exc
-        # upgrade applies to *new* requests of live sessions, never retroactively
+        now = iso(now_dt)
+        self._conn.execute(
+            "INSERT INTO policies(version, body, published_at) VALUES (?,?,?)",
+            (policy.version, json.dumps(policy.body), now),
+        )
+        # Upgrade applies to *new* requests of live sessions, never retroactively.
+        # Updating it in the publication transaction prevents a reader from using
+        # a policy that later failed to commit.
         self._conn.execute(
             "UPDATE sessions SET current_policy_v = ? WHERE status != 'terminated'",
             (policy.version,),
         )
         return policy
+
+    def submit_policy_draft(
+        self,
+        body: dict[str, Any],
+        actor: dict[str, Any],
+        *,
+        base_version: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Create a pending draft; this never changes the active policy."""
+        admin = _coerce_actor(actor, required_role=POLICY_ADMIN_ROLE)
+        try:
+            policy = Policy.from_dict(body)
+        except PolicyError as exc:
+            raise StoreError(str(exc), 400, "invalid_policy") from exc
+
+        now_dt = self._clock()
+        with self._policy_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = self.latest_policy_version()
+                base = current if base_version is None else int(base_version)
+                if base != current:
+                    raise StoreError(
+                        f"draft base version must be current v{current}",
+                        409,
+                        "policy_version_conflict",
+                    )
+                if policy.version <= current:
+                    raise StoreError(
+                        f"draft policy version must be > current v{current}",
+                        409,
+                        "policy_version_conflict",
+                    )
+                draft_id = "draft_" + secrets.token_hex(10)
+                now = iso(now_dt)
+                expires = iso(
+                    now_dt + timedelta(seconds=self.draft_ttl_seconds)
+                )
+                self._conn.execute(
+                    """INSERT INTO policy_drafts(
+                         id, base_version, target_version, body, status,
+                         submitted_by, submitted_roles, submitted_at, expires_at)
+                       VALUES (?,?,?,?,'pending',?,?,?,?)""",
+                    (
+                        draft_id,
+                        base,
+                        policy.version,
+                        json.dumps(policy.body, sort_keys=True),
+                        admin["id"],
+                        admin["roles"],
+                        now,
+                        expires,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        return self.get_policy_draft(draft_id)
+
+    def approve_policy_draft(
+        self,
+        draft_id: str,
+        actor: dict[str, Any],
+        *,
+        confirm_diff: bool = False,
+        expected_version: Optional[int] = None,
+    ) -> dict[str, Any]:
+        approver = _coerce_actor(actor, required_role=POLICY_APPROVER_ROLE)
+
+        with self._policy_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                draft = self._locked_draft(draft_id)
+                if draft["status"] == "approved":
+                    # Repeated approval of the same result is idempotent and does
+                    # not insert another policy version.
+                    self._conn.execute("COMMIT")
+                    result = self.get_policy_draft(draft_id)
+                    result["idempotent"] = True
+                    return result
+                if draft["status"] == "conflicted":
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        "draft is conflicted and cannot be published",
+                        409,
+                        "policy_version_conflict",
+                    )
+                if draft["status"] != "pending":
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        f"draft is {draft['status']}, not pending",
+                        409,
+                        "draft_not_pending",
+                    )
+                if approver["id"] == draft["submitted_by"]:
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        "the submitter cannot approve their own policy draft",
+                        403,
+                        "self_approval_forbidden",
+                    )
+                if confirm_diff is not True:
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        "confirm_diff must be true after reviewing the policy diff",
+                        400,
+                        "confirm_diff_required",
+                    )
+                now_dt = self._clock()
+                if now_dt >= parse_iso(draft["expires_at"]):
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError("policy draft has expired", 410, "draft_expired")
+                if (
+                    expected_version is not None
+                    and int(expected_version) != draft["target_version"]
+                ):
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        "expected draft target version does not match",
+                        409,
+                        "draft_version_mismatch",
+                    )
+
+                current = self.latest_policy_version()
+                if draft["base_version"] != current:
+                    self._mark_draft_terminal_locked(
+                        draft,
+                        "conflicted",
+                        approver,
+                        now_dt,
+                        f"base v{draft['base_version']} is no longer current v{current}",
+                    )
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        f"policy changed during approval: draft base v"
+                        f"{draft['base_version']} != current v{current}",
+                        409,
+                        "policy_version_conflict",
+                    )
+
+                policy_body = json.loads(draft["body"])
+                policy = Policy.from_dict(policy_body)
+                if policy.version != draft["target_version"]:
+                    raise StoreError("draft policy body was corrupted", 500)
+                self._publish_policy_locked(policy, now_dt)
+                self._mark_draft_terminal_locked(
+                    draft,
+                    "approved",
+                    approver,
+                    now_dt,
+                    "approved and published",
+                    published_version=policy.version,
+                )
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        result = self.get_policy_draft(draft_id)
+        result["idempotent"] = False
+        return result
+
+    def reject_policy_draft(
+        self,
+        draft_id: str,
+        actor: dict[str, Any],
+        reason: str = "rejected",
+    ) -> dict[str, Any]:
+        approver = _coerce_actor(actor, required_role=POLICY_APPROVER_ROLE)
+        with self._policy_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                draft = self._locked_draft(draft_id)
+                if draft["status"] == "rejected":
+                    # Repeated rejection is an idempotent no-op.
+                    self._conn.execute("COMMIT")
+                    return self.get_policy_draft(draft_id)
+                if draft["status"] != "pending":
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        f"draft is {draft['status']}, not pending",
+                        409,
+                        "draft_not_pending",
+                    )
+                now_dt = self._clock()
+                if now_dt >= parse_iso(draft["expires_at"]):
+                    reason = f"expired before rejection: {reason}"
+                self._mark_draft_terminal_locked(
+                    draft, "rejected", approver, now_dt, reason
+                )
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        return self.get_policy_draft(draft_id)
+
+    def withdraw_policy_draft(
+        self, draft_id: str, actor: dict[str, Any], reason: str = "withdrawn"
+    ) -> dict[str, Any]:
+        principal = _coerce_actor(actor)
+        with self._policy_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                draft = self._locked_draft(draft_id)
+                is_submitter = principal["id"] == draft["submitted_by"]
+                is_admin = _actor_has_role(principal, POLICY_ADMIN_ROLE)
+                if not (is_submitter or is_admin):
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        "only the submitter or a policy admin can withdraw",
+                        403,
+                        "forbidden",
+                    )
+                if draft["status"] == "withdrawn":
+                    self._conn.execute("COMMIT")
+                    return self.get_policy_draft(draft_id)
+                if draft["status"] != "pending":
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        f"draft is {draft['status']}, not pending",
+                        409,
+                        "draft_not_pending",
+                    )
+                now_dt = self._clock()
+                if now_dt >= parse_iso(draft["expires_at"]):
+                    reason = f"expired before withdrawal: {reason}"
+                self._mark_draft_terminal_locked(
+                    draft, "withdrawn", principal, now_dt, reason
+                )
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        return self.get_policy_draft(draft_id)
+
+    def _locked_draft(self, draft_id: str) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM policy_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            # Caller is responsible for rolling back the open transaction.
+            raise StoreError("policy draft not found", 404, "draft_not_found")
+        return row
+
+    def _mark_draft_terminal_locked(
+        self,
+        draft: sqlite3.Row,
+        status: str,
+        principal: dict[str, str],
+        now_dt: datetime,
+        reason: str,
+        *,
+        published_version: Optional[int] = None,
+    ) -> None:
+        self._conn.execute(
+            """UPDATE policy_drafts
+               SET status=?, decided_by=?, decided_roles=?, decided_at=?,
+                   result_reason=?, published_version=COALESCE(?, published_version)
+               WHERE id=?""",
+            (
+                status,
+                principal["id"],
+                principal["roles"],
+                iso(now_dt),
+                reason,
+                published_version,
+                draft["id"],
+            ),
+        )
+
+    def get_policy_draft(self, draft_id: str) -> dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT * FROM policy_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError("policy draft not found", 404, "draft_not_found")
+        return self._draft_view(row)
+
+    def list_policy_drafts(self, status: Optional[str] = None) -> list[dict[str, Any]]:
+        if status == "expired":
+            rows = self._conn.execute(
+                "SELECT * FROM policy_drafts WHERE status = 'pending' "
+                "ORDER BY submitted_at DESC, id"
+            ).fetchall()
+            views = [self._draft_view(r) for r in rows]
+            return [v for v in views if v["expired"]]
+        if status is not None:
+            rows = self._conn.execute(
+                "SELECT * FROM policy_drafts WHERE status = ? ORDER BY submitted_at, id",
+                (status,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM policy_drafts ORDER BY submitted_at DESC, id"
+            ).fetchall()
+        return [self._draft_view(r) for r in rows]
+
+    def _draft_view(self, row: sqlite3.Row) -> dict[str, Any]:
+        body = json.loads(row["body"])
+        base_row = self._conn.execute(
+            "SELECT body FROM policies WHERE version = ?", (row["base_version"],)
+        ).fetchone()
+        base_body = json.loads(base_row["body"]) if base_row else None
+        now_dt = self._clock()
+        expired = (
+            row["status"] == "pending"
+            and now_dt >= parse_iso(row["expires_at"])
+        )
+        return {
+            "id": row["id"],
+            "status": row["status"],
+            "effective_status": "expired" if expired else row["status"],
+            "expired": expired,
+            "base_version": row["base_version"],
+            "target_version": row["target_version"],
+            "current_version": self.latest_policy_version(),
+            "policy": body,
+            "diff": policy_diff(
+                base_body, body, row["base_version"], row["target_version"]
+            ),
+            "submitted_by": row["submitted_by"],
+            "submitted_roles": row["submitted_roles"],
+            "submitted_at": row["submitted_at"],
+            "expires_at": row["expires_at"],
+            "decided_by": row["decided_by"],
+            "decided_roles": row["decided_roles"],
+            "decided_at": row["decided_at"],
+            "result_reason": row["result_reason"],
+            "published_version": row["published_version"],
+        }
 
     def _get_policy(self, version: int) -> Policy:
         row = self._conn.execute(

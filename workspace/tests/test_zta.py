@@ -5,10 +5,12 @@ Run:  python -m pytest -q   or   python -m unittest discover -s tests
 
 import os
 import sys
+import json
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPConnection
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -296,6 +298,152 @@ class TestPolicyUpgrade(unittest.TestCase):
         self.assertTrue(rows[d1.audit_id]["allowed"])
 
 
+class TestPolicyDraftApproval(unittest.TestCase):
+    def setUp(self):
+        self.base = datetime(2026, 10, 6, 12, 0, 0, tzinfo=timezone.utc)
+        self.clock = Clock(self.base)
+        self.store = Store(":memory:", clock=self.clock, draft_ttl_seconds=60)
+        self.session = self.store.login(
+            "alice", "analyst", "CN", "dev-1", 3,
+        )
+        self.admin = {"id": "admin-1", "roles": ["admin"]}
+        self.approver = {"id": "approver-1", "roles": ["approver"]}
+        self.other_admin = {"id": "admin-2", "roles": ["admin"]}
+        self.viewer = {"id": "viewer-1", "roles": ["viewer"]}
+
+    def tearDown(self):
+        self.store.close()
+
+    def _draft_policy(self, version=2, **changes):
+        p = default_policy_v1()
+        p["version"] = version
+        p.update(changes)
+        return p
+
+    def test_submission_requires_admin_and_does_not_change_active_policy(self):
+        with self.assertRaises(StoreError) as cm:
+            self.store.submit_policy_draft(self._draft_policy(), self.viewer)
+        self.assertEqual(cm.exception.code, 403)
+        draft = self.store.submit_policy_draft(self._draft_policy(), self.admin)
+        self.assertEqual(draft["status"], "pending")
+        self.assertEqual(draft["effective_status"], "pending")
+        self.assertEqual(self.store.latest_policy_version(), 1)
+        d = self.store.decide(self.session["token"], "dashboard/x", "read")
+        self.assertEqual(d.policy_version, 1)
+
+    def test_approver_must_review_diff_and_cannot_self_approve(self):
+        submitter_approver = {"id": "same-person", "roles": ["admin", "approver"]}
+        draft = self.store.submit_policy_draft(
+            self._draft_policy(), submitter_approver
+        )
+        with self.assertRaises(StoreError) as cm:
+            self.store.approve_policy_draft(draft["id"], submitter_approver)
+        self.assertEqual(cm.exception.code, 403)
+
+        with self.assertRaises(StoreError) as cm:
+            self.store.approve_policy_draft(draft["id"], self.approver)
+        self.assertEqual(cm.exception.code, 400)
+        self.assertEqual(cm.exception.error_code, "confirm_diff_required")
+        self.assertEqual(self.store.latest_policy_version(), 1)
+
+    def test_repeated_approval_is_idempotent(self):
+        draft = self.store.submit_policy_draft(
+            self._draft_policy(constraints={"device_min_level": 4,
+                                            "network_countries": ["CN"]}),
+            self.admin,
+        )
+        first = self.store.approve_policy_draft(
+            draft["id"], self.approver, confirm_diff=True, expected_version=2
+        )
+        second = self.store.approve_policy_draft(
+            draft["id"], self.approver, confirm_diff=True, expected_version=2
+        )
+        self.assertEqual(first["status"], "approved")
+        self.assertEqual(second["status"], "approved")
+        self.assertEqual(first["published_version"], 2)
+        self.assertEqual(second["published_version"], 2)
+        self.assertEqual(self.store.latest_policy_version(), 2)
+        self.assertEqual(len(self.store.list_policies()), 2)
+
+    def test_reject_and_withdraw_leave_active_policy_unchanged(self):
+        rejectable = self.store.submit_policy_draft(self._draft_policy(2), self.admin)
+        rejected = self.store.reject_policy_draft(
+            rejectable["id"], self.approver, reason="bad diff"
+        )
+        repeated = self.store.reject_policy_draft(
+            rejectable["id"], self.approver, reason="bad diff again"
+        )
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(repeated["result_reason"], "bad diff")
+
+        withdrawable = self.store.submit_policy_draft(self._draft_policy(2), self.admin)
+        withdrawn = self.store.withdraw_policy_draft(
+            withdrawable["id"], self.admin, reason="not ready"
+        )
+        self.assertEqual(withdrawn["status"], "withdrawn")
+        with self.assertRaises(StoreError) as cm:
+            self.store.withdraw_policy_draft(withdrawable["id"], self.viewer)
+        self.assertEqual(cm.exception.code, 403)
+        self.assertEqual(self.store.latest_policy_version(), 1)
+
+    def test_expired_draft_cannot_be_published(self):
+        draft = self.store.submit_policy_draft(self._draft_policy(), self.admin)
+        self.clock.advance(61)
+        with self.assertRaises(StoreError) as cm:
+            self.store.approve_policy_draft(draft["id"], self.approver,
+                                            confirm_diff=True)
+        self.assertEqual(cm.exception.code, 410)
+        self.assertEqual(cm.exception.error_code, "draft_expired")
+        refreshed = self.store.get_policy_draft(draft["id"])
+        self.assertTrue(refreshed["expired"])
+        self.assertEqual(refreshed["effective_status"], "expired")
+        self.assertEqual(
+            [d["id"] for d in self.store.list_policy_drafts(status="expired")],
+            [draft["id"]],
+        )
+        self.assertEqual(self.store.latest_policy_version(), 1)
+
+    def test_approval_conflict_after_base_version_changes_does_not_overwrite(self):
+        stale = self.store.submit_policy_draft(self._draft_policy(2), self.admin)
+
+        # A newer policy is published directly by another administrative path.
+        newer = self._draft_policy(2)
+        newer["default"] = "deny"
+        self.store.publish_policy(newer)
+
+        # The stale draft claimed v2 and cannot overwrite the newly published v2.
+        with self.assertRaises(StoreError) as cm:
+            self.store.approve_policy_draft(stale["id"], self.approver,
+                                            confirm_diff=True)
+        self.assertEqual(cm.exception.code, 409)
+        self.assertEqual(cm.exception.error_code, "policy_version_conflict")
+        marked = self.store.get_policy_draft(stale["id"])
+        self.assertEqual(marked["status"], "conflicted")
+        self.assertEqual(self.store.latest_policy_version(), 2)
+
+    def test_concurrent_approval_publishes_exactly_one_policy(self):
+        draft = self.store.submit_policy_draft(self._draft_policy(2), self.admin)
+        errors = []
+
+        def approve():
+            try:
+                self.store.approve_policy_draft(
+                    draft["id"], self.approver, confirm_diff=True
+                )
+            except StoreError as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=approve) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(self.store.latest_policy_version(), 2)
+        self.assertEqual(len(self.store.list_policies()), 2)
+
+
 class TestConcurrency(unittest.TestCase):
     def setUp(self):
         self.store = Store(":memory:")
@@ -452,6 +600,71 @@ class TestAuditAndLazySignals(unittest.TestCase):
         self.assertFalse(d.allowed)
         self.assertEqual(d.reason, "country_not_allowed_by_policy")
         self.assertEqual(self.store.get_session(self.s["id"])["watermark"], w0)
+
+
+class TestDraftHttpApi(unittest.TestCase):
+    def setUp(self):
+        from zta.api import make_server
+        self.httpd = make_server("127.0.0.1", 0, ":memory:")
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.httpd.server_port
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.thread.join()
+        self.httpd.server_close()
+        self.httpd.store.close()
+
+    def request(self, method, path, body=None, headers=None):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps(body).encode() if body is not None else None
+        h = headers or {}
+        if payload is not None:
+            h = {**h, "Content-Type": "application/json"}
+        conn.request(method, path, body=payload, headers=h)
+        response = conn.getresponse()
+        data = json.loads(response.read().decode())
+        conn.close()
+        return response.status, data
+
+    def test_draft_approval_http_results_and_unauthorized_access(self):
+        p = default_policy_v1()
+        p["version"] = 2
+        status, body = self.request("POST", "/api/policies", p)
+        self.assertEqual(status, 401)
+        self.assertEqual(body["code"], "unauthorized")
+
+        status, body = self.request(
+            "POST", "/api/policies", p,
+            {"X-User-Id": "admin-1", "X-User-Roles": "admin"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["submitted"])
+        draft_id = body["draft"]["id"]
+
+        status, body = self.request(
+            "POST", f"/api/policy-drafts/{draft_id}/approve",
+            {"confirm_diff": True},
+            {"X-User-Id": "approver-1", "X-User-Roles": "viewer"},
+        )
+        self.assertEqual(status, 403)
+
+        status, first = self.request(
+            "POST", f"/api/policy-drafts/{draft_id}/approve",
+            {"confirm_diff": True, "expected_version": 2},
+            {"X-User-Id": "approver-1", "X-User-Roles": "approver"},
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(first["idempotent"])
+        status, second = self.request(
+            "POST", f"/api/policy-drafts/{draft_id}/approve",
+            {"confirm_diff": True, "expected_version": 2},
+            {"X-User-Id": "approver-1", "X-User-Roles": "approver"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(self.httpd.store.latest_policy_version(), 2)
 
 
 if __name__ == "__main__":

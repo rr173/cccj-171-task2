@@ -73,12 +73,27 @@ def main() -> None:
                              observed_at=iso(base + timedelta(seconds=70)))
     print(verdict(store.decide(s["token"], "dashboard/q3", "read")))
 
-    heading("7. 策略升级对新请求生效，但天花板永不扩大")
+    heading("7. 草稿审批后策略升级对新请求生效，但天花板永不扩大")
     v2 = default_policy_v1()
     v2["version"] = 2
     v2["rules"].append({"id": "new-grant", "roles": ["analyst"],
                         "resources": ["finance/*"], "actions": ["*"], "effect": "allow"})
-    store.publish_policy(v2)
+    admin = {"id": "admin-1", "roles": ["admin"]}
+    approver = {"id": "approver-1", "roles": ["approver"]}
+    draft = store.submit_policy_draft(v2, admin)
+    print(f"draft={draft['id']} status={draft['effective_status']} "
+          f"base=v{draft['base_version']} target=v{draft['target_version']} (active stays v1)")
+    store.approve_policy_draft(
+        draft["id"], approver, confirm_diff=True,
+        expected_version=draft["target_version"],
+    )
+    # repeated confirmation is idempotent and does not create another version
+    repeated = store.approve_policy_draft(
+        draft["id"], approver, confirm_diff=True,
+        expected_version=draft["target_version"],
+    )
+    print(f"repeated approval status={repeated['status']} "
+          f"published=v{repeated['published_version']} (idempotent)")
     d = store.decide(s["token"], "finance/payroll", "read")
     print(verdict(d), " <- 当前策略放行，但天花板拦截（不静默扩权）")
 

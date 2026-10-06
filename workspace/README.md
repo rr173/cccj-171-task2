@@ -2,8 +2,9 @@
 
 登录成功后，会话与**设备证明、网络位置、用户角色、初始策略版本**四要素绑定；
 此后的每个风险信号只能 **收束权限 / 要求再认证 / 终止会话**，永不静默扩大原授权。
-策略升级只对新请求生效，已执行操作保留当时裁决。信号乱序、设备证明更新、再认证与
-终止并发时，系统形成**单一会话水位**，旧信号不得恢复已撤销权限。
+管理员提交策略只能生成**待审草稿**；拥有 `approver` 角色且不是提交人的操作者核对差异后，
+才可发布。重复批准幂等；审批期间基线版本变化返回 409 冲突，绝不覆盖新版本。策略升级只对新请求生效，
+已执行操作保留当时裁决。信号乱序、设备证明更新、再认证与终止并发时，系统形成**单一会话水位**，旧信号不得恢复已撤销权限。
 
 仅依赖 Python 3.10+ 标准库（含 SQLite），无第三方依赖。
 
@@ -14,7 +15,7 @@ python3 -m zta.serve --host 127.0.0.1 --port 8080 --db zta.db
 # 浏览器打开 http://127.0.0.1:8080  （会话状态台，2 秒自动刷新）
 
 python3 demo.py            # 十条安全保证的离线演练
-python3 -m unittest discover -s tests -v   # 27 项测试（含并发压测）
+python3 -m unittest discover -s tests -v   # 35 项测试（含草稿审批与并发压测）
 ```
 
 ## 核心机制
@@ -53,12 +54,17 @@ python3 -m unittest discover -s tests -v   # 27 项测试（含并发压测）
 新策略即使增加了授权，也只能与天花板**取交集**，审计中可见
 `current_policy_grant=true` 而 `ceiling_grant=false` → `outside_login_ceiling`。
 
-### 4. 策略版本化，升级不追溯
+### 4. 策略草稿审批，版本化且不追溯
 
-- 策略为不可变 JSON，`version` 正整数且必须严格递增，重复发布返回 409。
+- 管理员（`admin`）调用 `POST /api/policies`（或 `/api/policy-drafts`）只能创建草稿，不改变当前策略。
+- 审批者（`approver`）必须不是提交人，并在 `confirm_diff=true` 明确确认差异后才能批准。
+- 草稿带 `base_version`、`target_version` 和 15 分钟默认 TTL；批准时在一个 SQLite
+  `BEGIN IMMEDIATE` 事务内重新检查基线并发布，防止并发覆盖。
+- 重复批准同一草稿返回同一已发布结果且不再插入版本；重复拒绝/撤回保持幂等。
+- 审批期间基线版本已变化：返回 `409 policy_version_conflict`，草稿标记为 `conflicted`，新版本不被覆盖。
+- 过期草稿返回 `410 draft_expired`；拒绝或撤回只结束草稿，当前生效策略完全不变。
 - 发布后更新所有存活会话的 `current_policy_v`，**仅对之后的请求生效**。
-- 审计是只追加表：每次裁决连同当时的策略版本、水位、原因快照落盘，
-  策略升级不会改写历史裁决。
+- 审计是只追加表：每次裁决连同当时的策略版本、水位、原因快照落盘，策略升级不会改写历史裁决。
 
 ### 5. 请求时惰性信号
 
@@ -70,7 +76,13 @@ python3 -m unittest discover -s tests -v   # 27 项测试（含并发压测）
 ## HTTP API
 
 所有接口返回 JSON；会话接口用 `Authorization: Bearer <token>`（也支持 body/query
-里传 `token`）。
+里传 `token`）。策略管理接口使用操作者身份头：
+
+- `X-User-Id: admin-1`
+- `X-User-Roles: admin` 或 `X-User-Roles: approver`（也支持逗号分隔多角色）
+
+参考实现假定这些头由已认证的 API 网关注入；本地脚本也可在 JSON body 中传
+`actor_id` / `actor_roles` 或 `actor: {id, roles}`。
 
 | 方法 & 路径 | 作用 |
 |---|---|
@@ -80,13 +92,39 @@ python3 -m unittest discover -s tests -v   # 27 项测试（含并发压测）
 | `POST /api/reauth` | `{nonce, clear?}` 再认证（nonce 须递增；可指定清除哪些门） |
 | `POST /api/attestation` | `{level, nonce, valid_seconds?}` 更新设备证明 |
 | `POST /api/terminate` | `{reason?}` 终止会话（幂等） |
-| `POST /api/policies` | 发布新版本策略（version 必须更大） |
+| `POST /api/policies` / `POST /api/policy-drafts` | `admin` 提交新版本待审草稿；策略正文可直接作为 body，也可放在 `policy` 字段 |
+| `GET /api/policy-drafts?status=` | 草稿列表（含差异、提交人、TTL、结果） |
+| `GET /api/policy-drafts/<id>` | 单个待审草稿与结构化差异 |
+| `POST /api/policy-drafts/<id>/approve` | `approver` 批准：`{confirm_diff:true, expected_version?}`；重复调用幂等 |
+| `POST /api/policy-drafts/<id>/reject` | `approver` 拒绝：`{reason?}`；不改变生效策略 |
+| `POST /api/policy-drafts/<id>/withdraw` | 提交人或 `admin` 撤回：`{reason?}`；不改变生效策略 |
 | `GET /api/policies` | 全部历史版本 |
 | `GET /api/session` | 当前会话状态（天花板/撤销集/门控/水位/证明） |
 | `GET /api/events` | 会话事件水位线（含被拒乱序信号） |
 | `GET /api/audit?session_id=&limit=` | 逐请求裁决审计（不可变） |
 | `GET /api/sessions` | 所有会话 |
 | `GET /` | 会话状态台（单页控制台） |
+
+### 草稿审批结果
+
+所有错误均返回 `{ "error": "...", "code": "..." }`：
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 401 | `unauthorized` | 缺少操作者身份 |
+| 403 | `forbidden` / `self_approval_forbidden` | 缺少 admin/approver 角色，或提交人自审 |
+| 400 | `confirm_diff_required` / `invalid_policy` | 未确认差异，或策略 JSON 不合法 |
+| 404 | `draft_not_found` | 草稿不存在 |
+| 409 | `policy_version_conflict` | 目标版本非递增或审批时基线已变化 |
+| 409 | `draft_not_pending` / `draft_version_mismatch` | 草稿已终态或请求版本与草稿不一致 |
+| 410 | `draft_expired` | 待审草稿已超过 TTL |
+
+批准成功返回：
+
+```json
+{"approved": true, "idempotent": false, "draft": {"status": "approved",
+ "base_version": 1, "target_version": 2, "published_version": 2, "diff": {}}}
+```
 
 ### 策略 JSON 示例
 
@@ -116,12 +154,12 @@ python3 -m unittest discover -s tests -v   # 27 项测试（含并发压测）
 ```
 zta/
   policy.py   不可变版本化策略模型（角色规则/约束/信号→收束动作）
-  store.py    会话状态机 + SQLite：水位锁、天花板、撤销集、门控、审计
+  store.py    会话状态机 + SQLite：水位锁、天花板、撤销集、门控、草稿审批、审计
   api.py      标准库 ThreadingHTTPServer 的 JSON API
-  ui.py       会话状态台（内嵌单页，零外部依赖）
+  ui.py       会话与策略草稿审批台（内嵌单页，零外部依赖）
   serve.py    启动入口
 tests/
-  test_zta.py 27 项测试：登录绑定/收束语义/乱序/nonce/升级/终态/并发/审计
+  test_zta.py 35 项测试：登录绑定/收束语义/乱序/nonce/草稿审批/升级/终态/并发/审计
 demo.py       十条安全保证的可运行演练
 ```
 
