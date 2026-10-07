@@ -141,6 +141,53 @@ def main() -> None:
     print(f"accepted seq = {seqs[0]}..{seqs[-1]}, contiguous={seqs == list(range(1, len(seqs)+1))}")
     store.close(); store2.close(); store3.close()
 
+    heading("11. 策略草稿审批：四眼确认差异后发布；拒绝/撤回/过期/冲突不改生效策略")
+    clock_t = {"t": base}
+    store4 = Store(":memory:", clock=lambda: clock_t["t"])
+    sess = store4.login("dave", "analyst", "CN", "dev-11", 3)
+    tightened = default_policy_v1()
+    tightened["version"] = 2
+    tightened["constraints"] = {"device_min_level": 4, "network_countries": ["CN"]}
+
+    draft = store4.submit_draft(tightened, operator="policy-admin", ttl_seconds=60)
+    print(f"草稿 {draft['id']}: pending, 基线 v{draft['base_version']} "
+          f"-> 提案 v{draft['proposed_version']}, 生效版本仍为 "
+          f"v{store4.latest_policy_version()}")
+    print("差异:", [(c["kind"], c.get("from"), c.get("to"))
+                    for c in draft["diff"]["changes"]])
+    try:
+        store4.approve_draft(draft["id"], operator="policy-admin",
+                             diff_digest=draft["diff_digest"])
+    except StoreError as e:
+        print(f"提交人无权审批 -> {e.code} {e.code_name}")
+    try:
+        store4.approve_draft(draft["id"], operator="policy-approver",
+                             diff_digest="wrong")
+    except StoreError as e:
+        print(f"差异指纹不符 -> {e.code} {e.code_name}")
+    approved = store4.approve_draft(draft["id"], operator="policy-approver",
+                                    diff_digest=draft["diff_digest"])
+    print(f"审批通过 -> published v{approved['published_version']}；"
+          f"重复确认幂等={store4.approve_draft(draft['id'], 'policy-approver', draft['diff_digest']).get('idempotent')}")
+    print("发布后新请求:", verdict(store4.decide(sess['token'], "dashboard/q3", "read")),
+          "（旧会话的授权上限不扩张，只按新策略收束）")
+
+    # reject leaves the live policy untouched
+    v3 = default_policy_v1(); v3["version"] = 3
+    rejected = store4.submit_draft(v3, operator="policy-admin")
+    store4.reject_draft(rejected["id"], operator="policy-approver", reason="nope")
+    print(f"拒绝后生效版本仍为 v{store4.latest_policy_version()}")
+
+    # expiry + concurrent base change => conflict, never overwrite
+    short = default_policy_v1(); short["version"] = 3
+    expired = store4.submit_draft(short, operator="policy-admin", ttl_seconds=60)
+    clock_t["t"] = clock_t["t"] + timedelta(seconds=61)
+    try:
+        store4.approve_draft(expired["id"], "policy-approver", expired["diff_digest"])
+    except StoreError as e:
+        print(f"过期草稿审批 -> {e.code} {e.code_name}")
+    store4.close()
+
 
 if __name__ == "__main__":
     main()

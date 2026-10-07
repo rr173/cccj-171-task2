@@ -131,11 +131,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>4 · 策略 API（新版本对新请求生效）</h2>
-      <details open><summary>策略 JSON（version 必须大于当前）</summary>
+      <h2>4 · 策略草稿审批（四眼原则 · 差异确认后发布）</h2>
+      <div class="row">
+        <div><label>操作者（提交）</label>
+          <select id="op_submit">
+            <option value="policy-admin">policy-admin（仅提交）</option>
+            <option value="policy-owner">policy-owner（提交+审批）</option>
+          </select></div>
+        <div><label>操作者（审批）</label>
+          <select id="op_approve">
+            <option value="policy-approver">policy-approver（仅审批）</option>
+            <option value="policy-owner">policy-owner（提交+审批）</option>
+            <option value="policy-admin">policy-admin（无审批权）</option>
+          </select></div>
+      </div>
+      <details open><summary>新策略 JSON（version 必须大于当前；提交后仅生成待审草稿）</summary>
         <textarea id="policyJson"></textarea></details>
-      <button onclick="publishPolicy()">发布新版本</button>
-      <button class="ghost" onclick="loadTightenedPolicy()">载入「收紧」模板(v2)</button>
+      <div class="row">
+        <div><label>草稿有效期 TTL（秒，默认 900）</label>
+          <input id="draftTtl" type="number" value="900"></div>
+        <div style="display:flex;align-items:flex-end">
+          <button onclick="submitDraft()">提交待审草稿</button>
+        </div>
+      </div>
+      <button class="ghost" onclick="loadTightenedPolicy()">载入「收紧」模板</button>
+      <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
+      <label style="margin-top:0">待审 / 历史草稿（含差异与审批结果）</label>
+      <div id="draftView" class="muted">尚无草稿。</div>
     </div>
 
     <div class="card">
@@ -187,17 +209,26 @@ function toast(msg, kind='') {
   setTimeout(() => el.remove(), 5000);
 }
 
-async function api(path, body) {
+async function api(path, body, operator) {
   const opts = body !== undefined
     ? { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }
     : {};
+  if (operator) {
+    opts.headers = opts.headers || {};
+    opts.headers['X-Operator-ID'] = operator;
+  }
   if (TOKEN && path !== '/api/login') {
     opts.headers = opts.headers || {};
     opts.headers['Authorization'] = 'Bearer ' + TOKEN;
   }
   const r = await fetch(path, opts);
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  if (!r.ok) {
+    const err = new Error(data.error || ('HTTP ' + r.status));
+    err.code = data.code || null;
+    err.payload = data;
+    throw err;
+  }
   return data;
 }
 
@@ -265,20 +296,135 @@ async function concurrentKill() {
   refresh();
 }
 
-async function publishPolicy() {
-  let body;
-  try { body = JSON.parse(val('policyJson')); }
+async function submitDraft() {
+  let policy;
+  try { policy = JSON.parse(val('policyJson')); }
   catch(e){ return toast('JSON 解析失败：'+e.message,'err'); }
-  try { await api('/api/policies', body);
-    toast('策略 v'+body.version+' 已发布（对新请求生效）','ok');
-  } catch(e){ toast(e.message,'err'); }
+  const payload = { policy, ttl_seconds: +val('draftTtl') || 900 };
+  try {
+    const d = await api('/api/policy-drafts', payload, val('op_submit'));
+    toast('草稿 ' + d.id + ' 已提交待审（基线 v'+d.base_version+' → 提案 v'
+          + d.proposed_version + '），不改变生效策略','ok');
+    refreshDrafts();
+  } catch(e){ toast('提交被拒：'+e.message,'err'); }
 }
+
+async function approveDraft(id) {
+  const op = val('op_approve');
+  let digest = null;
+  try {
+    const d = await api('/api/policy-drafts/' + id);
+    digest = d.diff_digest;
+  } catch(e){ return toast('读取草稿失败：'+e.message,'err'); }
+  // the approver confirms the exact diff they reviewed; the digest proves it
+  if (!confirm('请确认差异后发布。差异指纹：\n' + digest + '\n\n确认发布？')) return;
+  try {
+    const d = await api('/api/policy-drafts/' + id + '/approve',
+                        { diff_digest: digest }, op);
+    toast((d.idempotent?'重复确认（幂等），':'') +
+          '已发布：草稿 ' + d.id + ' → 策略 v' + d.published_version
+          + '（仅对之后的新请求生效）', 'ok');
+    refreshDrafts();
+  } catch(e){
+    const map = { base_version_mismatch:'冲突：审批期间生效版本已变化，未覆盖新版本',
+                  draft_expired:'草稿已过期，请重新提交',
+                  diff_mismatch:'差异指纹不匹配（草稿已变化）',
+                  forbidden:'操作者无审批权限' };
+    toast('审批失败：' + (map[e.code] || e.message), 'err');
+    refreshDrafts();
+  }
+}
+
+async function rejectDraft(id) {
+  const reason = prompt('拒绝原因（不改变当前生效策略）', '需要修订');
+  if (reason === null) return;
+  try {
+    await api('/api/policy-drafts/' + id + '/reject', { reason }, val('op_approve'));
+    toast('草稿已拒绝，当前生效策略不变','ok'); refreshDrafts();
+  } catch(e){ toast(e.message,'err'); refreshDrafts(); }
+}
+
+async function withdrawDraft(id) {
+  try {
+    await api('/api/policy-drafts/' + id + '/withdraw',
+              { reason:'console withdraw' }, val('op_submit'));
+    toast('草稿已撤回，当前生效策略不变','ok'); refreshDrafts();
+  } catch(e){ toast(e.message,'err'); refreshDrafts(); }
+}
+
+function changeKindLabel(k) {
+  return ({
+    rule_added:'规则新增 ➕', rule_removed:'规则删除 ➖', rule_changed:'规则变更 ✏️',
+    signal_rule_added:'信号规则新增', signal_rule_removed:'信号规则删除',
+    signal_rule_changed:'信号规则变更', constraints_changed:'约束变更',
+    default_changed:'默认裁决变更', section_changed:'配置段变更',
+  })[k] || k;
+}
+
+function renderDiff(d) {
+  const ch = d.changes || [];
+  if (!ch.length) return '<span class="muted">无差异（仅版本号变化）</span>';
+  return '<table><thead><tr><th>变更</th><th>对象</th><th>前</th><th>后</th></tr></thead><tbody>'
+    + ch.map(c => {
+      const target = esc(c.rule_id || c.signal || c.section || '');
+      const from = c.from === undefined ? '' : '<pre>'+esc(JSON.stringify(c.from,null,1))+'</pre>';
+      const to = c.to === undefined ? '' : '<pre>'+esc(JSON.stringify(c.to,null,1))+'</pre>';
+      const extra = c.rule ? '<pre>'+esc(JSON.stringify(c.rule,null,1))+'</pre>' : '';
+      return `<tr><td>${esc(changeKindLabel(c.kind))}</td><td class="tag">${target}</td>
+              <td>${from}</td>
+              <td>${to}${extra}</td></tr>`;
+    }).join('') + '</tbody></table>';
+}
+
+function renderDrafts(drafts) {
+  const box = document.getElementById('draftView');
+  if (!drafts.length) { box.innerHTML = '<span class="muted">尚无草稿。</span>'; return; }
+  box.innerHTML = drafts.slice(0, 6).map(d => {
+    const pending = d.status === 'pending';
+    const pillClass = {pending:'gated', approved:'active', rejected:'terminated',
+                       withdrawn:'terminated', expired:'terminated',
+                       conflicted:'terminated'}[d.status] || '';
+    const actions = pending ? `
+      <button onclick="approveDraft('${d.id}')">确认差异并发布</button>
+      <button class="ghost" onclick="rejectDraft('${d.id}')">拒绝</button>
+      <button class="danger" onclick="withdrawDraft('${d.id}')">撤回</button>` : '';
+    const result = d.status === 'approved'
+      ? `<span class="allow">已发布 v${d.published_version}</span>`
+      : d.status === 'pending'
+        ? (d.expired ? '<span class="deny">已过期（待操作时返回过期结果）</span>'
+                     : '<span class="muted">待审批</span>')
+        : `<span class="deny">${esc(d.status)}</span>`;
+    return `<div style="border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin:8px 0">
+      <div><span class="pill ${pillClass}">${esc(d.status)}</span>
+        <span class="tag">${esc(d.id)}</span> · ${result}</div>
+      <div class="muted" style="font-size:12px;margin:3px 0">
+        基线 v${d.base_version} → 提案 v${d.proposed_version}
+        · 提交人 ${esc(d.submitted_by)} · ${esc(d.submitted_at)}
+        · 截止 ${esc(d.expires_at)}
+        ${d.decided_by ? '· 裁决人 '+esc(d.decided_by)+' ('+esc(d.status)+')' : ''}
+        ${d.decision_reason && d.status!=='approved' ? '· '+esc(d.decision_reason) : ''}
+      </div>
+      <details ${pending?'open':''}><summary>差异（${d.diff.changes.length} 项）
+        · 指纹 <span class="tag">${esc(String(d.diff_digest).slice(0,16))}…</span></summary>
+        ${renderDiff(d.diff)}</details>
+      ${actions}
+    </div>`;
+  }).join('');
+}
+
+async function refreshDrafts() {
+  try {
+    const r = await api('/api/policy-drafts');
+    renderDrafts(r.drafts);
+  } catch(e) { /* console page still usable */ }
+}
+
 async function loadTightenedPolicy() {
   const cur = await api('/api/policies');
   const nextV = Math.max(...cur.policies.map(p=>p.version)) + 1;
   const p = structuredClone(cur.policies.at(-1).policy);
   p.version = nextV;
-  // tighten: analyst loses dashboard writes-adjacent wildcard? shrink countries & raise level
+  // tighten: raise device floor and shrink allowed countries
   p.constraints = { device_min_level: 4, network_countries: ['CN'] };
   val('policyJson', JSON.stringify(p, null, 2));
 }
@@ -376,6 +522,8 @@ function startPolling() {
 }
 
 if (TOKEN) { refresh(); startPolling(); }
+refreshDrafts();
+setInterval(refreshDrafts, 2000);
 api('/api/policies').then(p => {
   if (!val('policyJson')) val('policyJson', JSON.stringify(
     { ...p.policies.at(-1).policy, version: p.policies.at(-1).version+1 }, null, 2));

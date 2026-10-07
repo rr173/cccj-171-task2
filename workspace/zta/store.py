@@ -29,6 +29,7 @@ Monotonicity of privilege
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -53,12 +54,54 @@ def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+# Policy-administration permissions (draft submit / draft approval are
+# deliberately separate so a four-eyes workflow is possible).
+PERM_POLICY_SUBMIT = "policy:submit"
+PERM_POLICY_APPROVE = "policy:approve"
+
+DEFAULT_OPERATORS: dict[str, set[str]] = {
+    "policy-admin": {PERM_POLICY_SUBMIT},
+    "policy-approver": {PERM_POLICY_APPROVE},
+    "policy-owner": {PERM_POLICY_SUBMIT, PERM_POLICY_APPROVE},
+}
+
+DEFAULT_DRAFT_TTL_SECONDS = 900
+
+# Draft lifecycle:
+#   pending --approve--> approved (published, terminal)
+#          \--reject----> rejected (terminal, active policy untouched)
+#          \--withdraw--> withdrawn (terminal, active policy untouched)
+#          \--ttl-------> expired (lazy, terminal)
+#          \--base moved> conflicted (terminal, never overwrites the new version)
+DRAFT_PENDING = "pending"
+DRAFT_APPROVED = "approved"
+DRAFT_REJECTED = "rejected"
+DRAFT_WITHDRAWN = "withdrawn"
+DRAFT_EXPIRED = "expired"
+DRAFT_CONFLICTED = "conflicted"
+DRAFT_TERMINAL_STATUSES = (
+    DRAFT_APPROVED,
+    DRAFT_REJECTED,
+    DRAFT_WITHDRAWN,
+    DRAFT_EXPIRED,
+    DRAFT_CONFLICTED,
+)
+
+
 class StoreError(Exception):
     """Base error; ``code`` mirrors an HTTP status for the API layer."""
 
-    def __init__(self, message: str, code: int = 400):
+    def __init__(
+        self,
+        message: str,
+        code: int = 400,
+        code_name: Optional[str] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.code = code
+        self.code_name = code_name
+        self.extra = extra or {}
 
 
 class SessionTerminated(StoreError):
@@ -76,8 +119,18 @@ class Decision:
 
 
 class Store:
-    def __init__(self, path: str = ":memory:", clock=utcnow):
+    def __init__(
+        self,
+        path: str = ":memory:",
+        clock=utcnow,
+        operators: Optional[dict[str, set[str]]] = None,
+        draft_ttl_seconds: int = DEFAULT_DRAFT_TTL_SECONDS,
+    ):
         self._clock = clock
+        self._operators = (
+            operators if operators is not None else dict(DEFAULT_OPERATORS)
+        )
+        self._draft_ttl = int(draft_ttl_seconds)
         self._conn = sqlite3.connect(
             path,
             check_same_thread=False,
@@ -89,6 +142,8 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._locks_lock = threading.Lock()
         self._session_locks: dict[str, threading.Lock] = {}
+        self._draft_locks: dict[str, threading.Lock] = {}
+        self._policy_lock = threading.Lock()  # serialises publish/draft decisions
         self._init_schema()
         self._seed()
 
@@ -163,6 +218,36 @@ class Store:
                 detail         TEXT NOT NULL,
                 decided_at     TEXT NOT NULL
             );
+
+            -- policy drafts awaiting four-eyes approval; one pending draft at
+            -- most, publishing happens only through an approval
+            CREATE TABLE IF NOT EXISTS policy_drafts (
+                id              TEXT PRIMARY KEY,
+                proposed_version INTEGER NOT NULL,
+                base_version    INTEGER NOT NULL,
+                body            TEXT NOT NULL,
+                diff_json       TEXT NOT NULL,
+                diff_digest     TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                submitted_by    TEXT NOT NULL,
+                submitted_at    TEXT NOT NULL,
+                expires_at      TEXT NOT NULL,
+                decided_by      TEXT,
+                decided_at      TEXT,
+                decision_reason TEXT,
+                published_version INTEGER
+            );
+
+            -- append-only journal of every draft lifecycle attempt
+            CREATE TABLE IF NOT EXISTS draft_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id    TEXT NOT NULL,
+                kind        TEXT NOT NULL,   -- submit|approve|reject|withdraw
+                operator    TEXT,
+                accepted    INTEGER NOT NULL,
+                detail      TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
             """
         )
 
@@ -231,6 +316,562 @@ class Store:
             }
             for r in rows
         ]
+
+    # -------------------------------------------------- policy draft review
+
+    def _lock_for_draft(self, draft_id: str) -> threading.Lock:
+        with self._locks_lock:
+            lock = self._draft_locks.get(draft_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._draft_locks[draft_id] = lock
+            return lock
+
+    def _require_permission(self, operator: Optional[str], permission: str) -> None:
+        if not operator:
+            raise StoreError(
+                "operator identity required (X-Operator-ID or 'operator')",
+                401,
+                "unauthenticated",
+            )
+        if permission not in self._operators.get(operator, set()):
+            raise StoreError(
+                f"operator {operator!r} lacks permission {permission!r}",
+                403,
+                "forbidden",
+                {"operator": operator, "required_permission": permission},
+            )
+
+    @staticmethod
+    def _rule_key(rule: dict[str, Any], index: int) -> str:
+        rid = rule.get("id")
+        return str(rid) if rid else f"#{index}"
+
+    @classmethod
+    def _index_rules(cls, rules: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(rules, list):
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for i, r in enumerate(rules):
+            if isinstance(r, dict):
+                out[cls._rule_key(r, i)] = r
+        return out
+
+    @classmethod
+    def policy_diff(cls, base: dict[str, Any], proposed: dict[str, Any]) -> dict[str, Any]:
+        """Structural diff shown to the approver.  Explicitly reports rule
+        additions/removals/changes plus scalar/section edits so a widened grant
+        can never hide inside an opaque blob."""
+        changed: list[dict[str, Any]] = []
+
+        # rules
+        base_rules = cls._index_rules(base.get("rules", []))
+        prop_rules = cls._index_rules(proposed.get("rules", []))
+        for key in sorted(set(base_rules) | set(prop_rules)):
+            if key not in base_rules:
+                changed.append({"kind": "rule_added", "rule_id": key, "rule": prop_rules[key]})
+            elif key not in prop_rules:
+                changed.append({"kind": "rule_removed", "rule_id": key, "rule": base_rules[key]})
+            elif base_rules[key] != prop_rules[key]:
+                changed.append({
+                    "kind": "rule_changed",
+                    "rule_id": key,
+                    "from": base_rules[key],
+                    "to": prop_rules[key],
+                })
+
+        # signal rules keyed on the signal they match
+        def sig_rules(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
+            out: dict[str, dict[str, Any]] = {}
+            for i, sr in enumerate(body.get("signal_rules", []) or []):
+                if isinstance(sr, dict) and sr.get("signal"):
+                    out[str(sr["signal"])] = sr
+            return out
+
+        b_sig, p_sig = sig_rules(base), sig_rules(proposed)
+        for key in sorted(set(b_sig) | set(p_sig)):
+            if key not in b_sig:
+                changed.append({"kind": "signal_rule_added", "signal": key, "rule": p_sig[key]})
+            elif key not in p_sig:
+                changed.append({"kind": "signal_rule_removed", "signal": key, "rule": b_sig[key]})
+            elif b_sig[key] != p_sig[key]:
+                changed.append({
+                    "kind": "signal_rule_changed",
+                    "signal": key, "from": b_sig[key], "to": p_sig[key],
+                })
+
+        constraints_b = base.get("constraints", {}) or {}
+        constraints_p = proposed.get("constraints", {}) or {}
+        if constraints_b != constraints_p:
+            changed.append({
+                "kind": "constraints_changed",
+                "from": constraints_b,
+                "to": constraints_p,
+            })
+        if base.get("default", "deny") != proposed.get("default", "deny"):
+            changed.append({
+                "kind": "default_changed",
+                "from": base.get("default", "deny"),
+                "to": proposed.get("default", "deny"),
+            })
+        # any other top-level keys (forward compatibility) are still surfaced
+        known = {"version", "rules", "signal_rules", "constraints", "default"}
+        for key in sorted((set(base) | set(proposed)) - known):
+            if base.get(key) != proposed.get(key):
+                changed.append({
+                    "kind": "section_changed",
+                    "section": key,
+                    "from": base.get(key),
+                    "to": proposed.get(key),
+                })
+        return {
+            "base_version": base.get("version"),
+            "proposed_version": proposed.get("version"),
+            "changes": changed,
+        }
+
+    @staticmethod
+    def _diff_digest(diff: dict[str, Any]) -> str:
+        blob = json.dumps(diff, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _draft_row(self, draft_id: str) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM policy_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"policy draft {draft_id!r} not found", 404, "not_found")
+        return row
+
+    def _draft_view(self, row: sqlite3.Row, include_events: bool = False) -> dict[str, Any]:
+        effective_status = row["status"]
+        now = self._clock()
+        if row["status"] == DRAFT_PENDING and now > parse_iso(row["expires_at"]):
+            effective_status = DRAFT_EXPIRED
+        data = {
+            "id": row["id"],
+            "status": effective_status,
+            "stored_status": row["status"],
+            "proposed_version": row["proposed_version"],
+            "base_version": row["base_version"],
+            "policy": json.loads(row["body"]),
+            "diff": json.loads(row["diff_json"]),
+            "diff_digest": row["diff_digest"],
+            "submitted_by": row["submitted_by"],
+            "submitted_at": row["submitted_at"],
+            "expires_at": row["expires_at"],
+            "expired": effective_status == DRAFT_EXPIRED,
+            "decided_by": row["decided_by"],
+            "decided_at": row["decided_at"],
+            "decision_reason": row["decision_reason"],
+            "published_version": row["published_version"],
+        }
+        if include_events:
+            data["events"] = self.list_draft_events(row["id"])
+        return data
+
+    def list_draft_events(self, draft_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM draft_events WHERE draft_id = ? ORDER BY id", (draft_id,)
+        ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "draft_id": r["draft_id"],
+                "kind": r["kind"],
+                "operator": r["operator"],
+                "accepted": bool(r["accepted"]),
+                "detail": json.loads(r["detail"]),
+                "recorded_at": r["recorded_at"],
+            }
+            for r in rows
+        ]
+
+    def _journal_draft(
+        self,
+        draft_id: str,
+        kind: str,
+        operator: Optional[str],
+        accepted: bool,
+        detail: dict[str, Any],
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO draft_events
+               (draft_id, kind, operator, accepted, detail, recorded_at)
+               VALUES (?,?,?,?,?,?)""",
+            (
+                draft_id,
+                kind,
+                operator,
+                1 if accepted else 0,
+                json.dumps(detail, sort_keys=True),
+                iso(self._clock()),
+            ),
+        )
+
+    def list_drafts(self, status: Optional[str] = None) -> list[dict[str, Any]]:
+        if status:
+            rows = self._conn.execute(
+                "SELECT * FROM policy_drafts WHERE status = ? ORDER BY submitted_at DESC",
+                (status,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM policy_drafts ORDER BY submitted_at DESC"
+            ).fetchall()
+        return [self._draft_view(r) for r in rows]
+
+    def get_draft(self, draft_id: str, include_events: bool = False) -> dict[str, Any]:
+        return self._draft_view(self._draft_row(draft_id), include_events)
+
+    def submit_draft(
+        self,
+        body: dict[str, Any],
+        operator: Optional[str],
+        ttl_seconds: Optional[int] = None,
+        base_version: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """An administrator's new policy only becomes a *pending draft*.
+
+        The draft snapshots the current policy and the structural diff an
+        approver must confirm; nothing here touches the active policy."""
+        self._require_permission(operator, PERM_POLICY_SUBMIT)
+        policy = Policy.from_dict(body)  # validates before any state change
+        ttl = int(ttl_seconds) if ttl_seconds is not None else self._draft_ttl
+        if ttl <= 0:
+            raise StoreError("ttl_seconds must be positive", 400, "bad_request")
+
+        now = self._clock()
+        with self._policy_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                latest_v = self.latest_policy_version()
+                if base_version is not None and base_version != latest_v:
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        f"base version {base_version} is not current ({latest_v})",
+                        409,
+                        "base_version_mismatch",
+                        {"base_version": base_version, "current_version": latest_v},
+                    )
+                if policy.version <= latest_v:
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        f"proposed version {policy.version} must be > current {latest_v}",
+                        409,
+                        "version_too_low",
+                        {"proposed_version": policy.version, "current_version": latest_v},
+                    )
+                base_body = json.loads(
+                    self._conn.execute(
+                        "SELECT body FROM policies WHERE version = ?", (latest_v,)
+                    ).fetchone()["body"]
+                )
+                pending = self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM policy_drafts WHERE status = ?",
+                    (DRAFT_PENDING,),
+                ).fetchone()["c"]
+                if pending:
+                    self._conn.execute("ROLLBACK")
+                    raise StoreError(
+                        "a pending policy draft already exists; approve, reject or "
+                        "withdraw it before submitting another",
+                        409,
+                        "draft_already_pending",
+                    )
+                diff = self.policy_diff(base_body, policy.body)
+                digest = self._diff_digest(diff)
+                draft_id = "draft_" + secrets.token_hex(10)
+                expires = iso(
+                    datetime.fromtimestamp(now.timestamp() + ttl, timezone.utc)
+                )
+                self._conn.execute(
+                    """INSERT INTO policy_drafts(
+                        id, proposed_version, base_version, body, diff_json,
+                        diff_digest, status, submitted_by, submitted_at, expires_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        draft_id, policy.version, latest_v,
+                        json.dumps(policy.body), json.dumps(diff, ensure_ascii=False),
+                        digest, DRAFT_PENDING, operator, iso(now), expires,
+                    ),
+                )
+                self._journal_draft(
+                    draft_id, "submit", operator, True,
+                    {"base_version": latest_v, "proposed_version": policy.version,
+                     "ttl_seconds": ttl, "diff_digest": digest},
+                )
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        return self.get_draft(draft_id, include_events=True)
+
+    def approve_draft(
+        self,
+        draft_id: str,
+        operator: Optional[str],
+        diff_digest: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Publish a pending draft after confirming its diff.
+
+        Idempotent: approving an already approved draft again returns the same
+        publication result.  If the active policy moved while the draft was
+        waiting, the call fails with a conflict and never overwrites the newer
+        version."""
+        self._require_permission(operator, PERM_POLICY_APPROVE)
+        now = self._clock()
+        with self._lock_for_draft(draft_id):
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._draft_row(draft_id)
+                status = row["status"]
+
+                if status == DRAFT_APPROVED:
+                    # idempotent confirmation: no second publication, no journal
+                    self._conn.execute("COMMIT")
+                    view = self.get_draft(draft_id, include_events=True)
+                    view["idempotent"] = True
+                    return view
+
+                if status != DRAFT_PENDING:
+                    self._journal_draft(
+                        draft_id, "approve", operator, False,
+                        {"rejected": f"draft_{status}"},
+                    )
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        f"draft is {status}; only pending drafts can be approved",
+                        409,
+                        f"draft_{status}",
+                    )
+
+                if now > parse_iso(row["expires_at"]):
+                    self._conn.execute(
+                        "UPDATE policy_drafts SET status = ? WHERE id = ?",
+                        (DRAFT_EXPIRED, draft_id),
+                    )
+                    self._journal_draft(
+                        draft_id, "approve", operator, False,
+                        {"rejected": "draft_expired",
+                         "expires_at": row["expires_at"]},
+                    )
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        f"draft expired at {row['expires_at']}; submit a fresh one",
+                        409,
+                        "draft_expired",
+                        {"expires_at": row["expires_at"]},
+                    )
+
+                if not diff_digest:
+                    self._journal_draft(
+                        draft_id, "approve", operator, False,
+                        {"rejected": "missing_diff_digest"},
+                    )
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        "approve requires diff_digest: the approver must confirm "
+                        "the exact diff reviewed",
+                        409,
+                        "diff_mismatch",
+                        {"expected_digest": row["diff_digest"]},
+                    )
+                if diff_digest != row["diff_digest"]:
+                    self._journal_draft(
+                        draft_id, "approve", operator, False,
+                        {"rejected": "diff_mismatch",
+                         "expected_digest": row["diff_digest"],
+                         "provided_digest": diff_digest},
+                    )
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        "diff_digest does not match the draft's current diff; "
+                        "the draft changed or the wrong diff was confirmed",
+                        409,
+                        "diff_mismatch",
+                        {"expected_digest": row["diff_digest"],
+                         "provided_digest": diff_digest},
+                    )
+
+                latest_v = self.latest_policy_version()
+                if latest_v != row["base_version"]:
+                    # the policy moved during review: fail with a conflict and
+                    # never overwrite the newer version
+                    self._conn.execute(
+                        "UPDATE policy_drafts SET status = ? WHERE id = ?",
+                        (DRAFT_CONFLICTED, draft_id),
+                    )
+                    self._journal_draft(
+                        draft_id, "approve", operator, False,
+                        {"rejected": "base_version_mismatch",
+                         "base_version": row["base_version"],
+                         "current_version": latest_v},
+                    )
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        f"conflict: current policy is v{latest_v} but the draft was "
+                        f"reviewed against v{row['base_version']}; the newer version "
+                        "was kept, submit a fresh draft",
+                        409,
+                        "base_version_mismatch",
+                        {"base_version": row["base_version"],
+                         "current_version": latest_v},
+                    )
+
+                policy = Policy.from_dict(json.loads(row["body"]))
+                now_iso = iso(now)
+                self._conn.execute(
+                    "INSERT INTO policies(version, body, published_at) VALUES (?,?,?)",
+                    (policy.version, json.dumps(policy.body), now_iso),
+                )
+                # upgrade applies to *new* requests of live sessions only
+                self._conn.execute(
+                    "UPDATE sessions SET current_policy_v = ? "
+                    "WHERE status != 'terminated'",
+                    (policy.version,),
+                )
+                self._conn.execute(
+                    """UPDATE policy_drafts SET
+                        status = ?, decided_by = ?, decided_at = ?,
+                        decision_reason = ?, published_version = ?
+                       WHERE id = ?""",
+                    (DRAFT_APPROVED, operator, now_iso, "approved",
+                     policy.version, draft_id),
+                )
+                self._journal_draft(
+                    draft_id, "approve", operator, True,
+                    {"published_version": policy.version,
+                     "diff_digest": diff_digest},
+                )
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        return self.get_draft(draft_id, include_events=True)
+
+    def reject_draft(
+        self,
+        draft_id: str,
+        operator: Optional[str],
+        reason: str = "rejected",
+    ) -> dict[str, Any]:
+        """Reject a pending draft.  The active policy is never changed."""
+        self._require_permission(operator, PERM_POLICY_APPROVE)
+        with self._lock_for_draft(draft_id):
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._draft_row(draft_id)
+                if row["status"] == DRAFT_REJECTED:
+                    self._conn.execute("COMMIT")
+                    view = self.get_draft(draft_id, include_events=True)
+                    view["idempotent"] = True
+                    return view
+                if row["status"] != DRAFT_PENDING:
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        f"draft is {row['status']}; only pending drafts can be rejected",
+                        409,
+                        f"draft_{row['status']}",
+                    )
+                if self._clock() > parse_iso(row["expires_at"]):
+                    self._conn.execute(
+                        "UPDATE policy_drafts SET status = ? WHERE id = ?",
+                        (DRAFT_EXPIRED, draft_id),
+                    )
+                    self._journal_draft(
+                        draft_id, "reject", operator, False,
+                        {"rejected": "draft_expired"},
+                    )
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        f"draft expired at {row['expires_at']}",
+                        409,
+                        "draft_expired",
+                        {"expires_at": row["expires_at"]},
+                    )
+                now_iso = iso(self._clock())
+                self._conn.execute(
+                    """UPDATE policy_drafts SET status = ?, decided_by = ?,
+                       decided_at = ?, decision_reason = ? WHERE id = ?""",
+                    (DRAFT_REJECTED, operator, now_iso, reason, draft_id),
+                )
+                self._journal_draft(
+                    draft_id, "reject", operator, True, {"reason": reason}
+                )
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        return self.get_draft(draft_id, include_events=True)
+
+    def withdraw_draft(
+        self,
+        draft_id: str,
+        operator: Optional[str],
+        reason: str = "withdrawn",
+    ) -> dict[str, Any]:
+        """The submitter side pulls a pending draft back.  Active policy
+        untouched; rejection/withdrawal can never alter what is in force."""
+        self._require_permission(operator, PERM_POLICY_SUBMIT)
+        with self._lock_for_draft(draft_id):
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._draft_row(draft_id)
+                if row["status"] == DRAFT_WITHDRAWN:
+                    self._conn.execute("COMMIT")
+                    view = self.get_draft(draft_id, include_events=True)
+                    view["idempotent"] = True
+                    return view
+                if row["status"] != DRAFT_PENDING:
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        f"draft is {row['status']}; only pending drafts can be withdrawn",
+                        409,
+                        f"draft_{row['status']}",
+                    )
+                if self._clock() > parse_iso(row["expires_at"]):
+                    self._conn.execute(
+                        "UPDATE policy_drafts SET status = ? WHERE id = ?",
+                        (DRAFT_EXPIRED, draft_id),
+                    )
+                    self._journal_draft(
+                        draft_id, "withdraw", operator, False,
+                        {"rejected": "draft_expired"},
+                    )
+                    self._conn.execute("COMMIT")
+                    raise StoreError(
+                        f"draft expired at {row['expires_at']}",
+                        409,
+                        "draft_expired",
+                        {"expires_at": row["expires_at"]},
+                    )
+                now_iso = iso(self._clock())
+                self._conn.execute(
+                    """UPDATE policy_drafts SET status = ?, decided_by = ?,
+                       decided_at = ?, decision_reason = ? WHERE id = ?""",
+                    (DRAFT_WITHDRAWN, operator, now_iso, reason, draft_id),
+                )
+                self._journal_draft(
+                    draft_id, "withdraw", operator, True, {"reason": reason}
+                )
+                self._conn.execute("COMMIT")
+            except StoreError:
+                self._safe_rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._safe_rollback()
+                raise StoreError(f"database error: {exc}", 500) from exc
+        return self.get_draft(draft_id, include_events=True)
 
     # ---------------------------------------------------------------- login
 
@@ -573,6 +1214,7 @@ class Store:
                 )
                 self._conn.execute("COMMIT")
             except StoreError:
+                self._safe_rollback()
                 raise
             except sqlite3.Error as exc:
                 self._safe_rollback()
@@ -750,6 +1392,7 @@ class Store:
                 )
                 self._conn.execute("COMMIT")
             except StoreError:
+                self._safe_rollback()
                 raise
             except sqlite3.Error as exc:
                 self._safe_rollback()
@@ -845,6 +1488,7 @@ class Store:
                 )
                 self._conn.execute("COMMIT")
             except StoreError:
+                self._safe_rollback()
                 raise
             except sqlite3.Error as exc:
                 self._safe_rollback()
@@ -921,6 +1565,7 @@ class Store:
                 )
                 self._conn.execute("COMMIT")
             except StoreError:
+                self._safe_rollback()
                 raise
             except sqlite3.Error as exc:
                 self._safe_rollback()
@@ -1119,6 +1764,7 @@ class Store:
                 )
                 self._conn.execute("COMMIT")
             except StoreError:
+                self._safe_rollback()
                 raise
             except sqlite3.Error as exc:
                 self._safe_rollback()

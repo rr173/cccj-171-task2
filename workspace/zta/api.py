@@ -79,14 +79,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             result = fn()
         except SessionTerminated as exc:
-            self._send_json({"error": str(exc), "code": "session_terminated"}, exc.code)
+            payload: dict[str, Any] = {"error": str(exc), "code": "session_terminated"}
+            self._send_json(payload, exc.code)
         except StoreError as exc:
-            self._send_json({"error": str(exc)}, exc.code)
+            payload = {"error": str(exc)}
+            if exc.code_name:
+                payload["code"] = exc.code_name
+            if exc.extra:
+                payload.update(exc.extra)
+            self._send_json(payload, exc.code)
         except Exception as exc:  # never leak a stack trace over HTTP
             self._send_json({"error": f"internal error: {exc}"}, 500)
         else:
             if result is not None:
                 self._send_json(result)
+
+    def _operator(self, data: dict[str, Any]) -> str:
+        op = self.headers.get("X-Operator-ID", "")
+        if not op:
+            op = str(data.get("operator") or "").strip()
+        return op.strip()
 
     # ------------------------------------------------------------------ GET
 
@@ -103,6 +115,18 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         if path == "/api/policies":
             return self._handle(lambda: {"policies": self.store.list_policies()})
+
+        if path == "/api/policy-drafts":
+            def list_drafts() -> dict[str, Any]:
+                status = self._query().get("status")
+                return {"drafts": self.store.list_drafts(status=status)}
+            return self._handle(list_drafts)
+
+        if path.startswith("/api/policy-drafts/"):
+            draft_id = path.rsplit("/", 1)[-1]
+            return self._handle(
+                lambda: self.store.get_draft(draft_id, include_events=True)
+            )
 
         if path == "/api/sessions":
             return self._handle(lambda: {"sessions": self.store.list_sessions()})
@@ -177,7 +201,57 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._handle(action)
 
         if path == "/api/policies":
-            return self._post_policy(data)
+            # Policy changes now enter the four-eyes draft workflow first.
+            def deprecated_publish() -> dict[str, Any]:
+                raise StoreError(
+                    "direct policy publishing is disabled: submit a draft via "
+                    "POST /api/policy-drafts and have it approved "
+                    "(POST /api/policy-drafts/<id>/approve)",
+                    403,
+                    "draft_required",
+                )
+            return self._handle(deprecated_publish)
+
+        if path == "/api/policy-drafts":
+            def submit() -> dict[str, Any]:
+                policy_body = data.get("policy", data)
+                return self.store.submit_draft(
+                    body=policy_body,
+                    operator=self._operator(data),
+                    ttl_seconds=data.get("ttl_seconds"),
+                    base_version=data.get("base_version"),
+                )
+            return self._handle(submit)
+
+        if path.endswith("/approve") and "/policy-drafts/" in path:
+            def approve() -> dict[str, Any]:
+                draft_id = path.split("/")[3]
+                return self.store.approve_draft(
+                    draft_id=draft_id,
+                    operator=self._operator(data),
+                    diff_digest=data.get("diff_digest"),
+                )
+            return self._handle(approve)
+
+        if path.endswith("/reject") and "/policy-drafts/" in path:
+            def reject() -> dict[str, Any]:
+                draft_id = path.split("/")[3]
+                return self.store.reject_draft(
+                    draft_id=draft_id,
+                    operator=self._operator(data),
+                    reason=str(data.get("reason") or "rejected"),
+                )
+            return self._handle(reject)
+
+        if path.endswith("/withdraw") and "/policy-drafts/" in path:
+            def withdraw() -> dict[str, Any]:
+                draft_id = path.split("/")[3]
+                return self.store.withdraw_draft(
+                    draft_id=draft_id,
+                    operator=self._operator(data),
+                    reason=str(data.get("reason") or "withdrawn"),
+                )
+            return self._handle(withdraw)
 
         if path == "/api/signals":
             def action() -> dict[str, Any]:
@@ -252,12 +326,6 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._handle(action)
 
         self._send_json({"error": f"not found: {path}"}, 404)
-
-    def _post_policy(self, data: dict[str, Any]) -> None:
-        def action() -> dict[str, Any]:
-            policy = self.store.publish_policy(data)
-            return {"published": True, "version": policy.version}
-        self._handle(action)
 
 
 def make_server(
